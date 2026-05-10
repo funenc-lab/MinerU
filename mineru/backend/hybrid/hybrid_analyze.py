@@ -16,6 +16,7 @@ from mineru.backend.hybrid.hybrid_model_output_to_middle_json import (
     finalize_middle_json,
     init_middle_json,
 )
+from mineru.backend.utils.cross_page_text_vlm import is_enabled as vlm_cross_page_text_merge_enabled
 from mineru.backend.utils.runtime_utils import exclude_progress_bar_idle_time
 from mineru.backend.pipeline.model_init import HybridModelSingleton
 from mineru.backend.vlm.vlm_analyze import (
@@ -552,6 +553,7 @@ def doc_analyze(
         model_path: str | None = None,
         server_url: str | None = None,
         image_analysis: bool = True,
+        vlm_report_dir: str | None = None,
         **kwargs,
 ):
     if predictor is None:
@@ -644,6 +646,7 @@ def doc_analyze(
                         _ocr_enable=_ocr_enable,
                         _vlm_ocr_enable=_vlm_ocr_enable,
                         progress_bar=progress_bar,
+                        keep_page_images=vlm_cross_page_text_merge_enabled(),
                     )
                     last_append_end_time = time.time()
                 finally:
@@ -664,6 +667,7 @@ def doc_analyze(
             hybrid_pipeline_model,
             _ocr_enable,
             _vlm_ocr_enable,
+            vlm_report_dir=vlm_report_dir,
         )
         close_pdfium_document(pdf_doc)
         doc_closed = True
@@ -685,6 +689,7 @@ async def aio_doc_analyze(
     model_path: str | None = None,
     server_url: str | None = None,
     image_analysis: bool = True,
+    vlm_report_dir: str | None = None,
     **kwargs,
 ):
     if predictor is None:
@@ -776,6 +781,7 @@ async def aio_doc_analyze(
                         _ocr_enable=_ocr_enable,
                         _vlm_ocr_enable=_vlm_ocr_enable,
                         progress_bar=progress_bar,
+                        keep_page_images=vlm_cross_page_text_merge_enabled(),
                     )
                     last_append_end_time = time.time()
                 finally:
@@ -796,6 +802,7 @@ async def aio_doc_analyze(
             hybrid_pipeline_model,
             _ocr_enable,
             _vlm_ocr_enable,
+            vlm_report_dir=vlm_report_dir,
         )
         close_pdfium_document(pdf_doc)
         doc_closed = True

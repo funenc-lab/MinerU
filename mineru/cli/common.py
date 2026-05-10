@@ -494,6 +494,7 @@ def _process_hybrid(
             language=lang,
             inline_formula_enable=inline_formula_enable,
             server_url=server_url,
+            vlm_report_dir=os.path.join(local_md_dir, "cross_page_text_vlm_report"),
             **kwargs,
         )
 
@@ -550,6 +551,7 @@ async def _async_process_hybrid(
             language=lang,
             inline_formula_enable=inline_formula_enable,
             server_url=server_url,
+            vlm_report_dir=os.path.join(local_md_dir, "cross_page_text_vlm_report"),
             **kwargs,
         )
 

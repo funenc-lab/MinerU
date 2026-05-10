@@ -20,6 +20,11 @@ from mineru.backend.utils.para_block_utils import (
     iter_block_spans,
     merge_para_text_blocks,
 )
+from mineru.backend.utils.cross_page_text_vlm import (
+    PAGE_IMAGE_KEY,
+    apply_vlm_cross_page_text_merge,
+    is_enabled as vlm_cross_page_text_merge_enabled,
+)
 from mineru.backend.hybrid.hybrid_magic_model import MagicModel
 from mineru.backend.utils.runtime_utils import cross_page_table_merge
 from mineru.utils.config_reader import get_table_enable, get_llm_aided_config
@@ -190,6 +195,7 @@ def append_page_results_to_middle_json(
     _ocr_enable=False,
     _vlm_ocr_enable=False,
     progress_bar=None,
+    keep_page_images=False,
 ):
     for offset, (page_model_list, image_dict) in enumerate(
         zip(model_list, images_list)
@@ -206,6 +212,8 @@ def append_page_results_to_middle_json(
             _ocr_enable,
             _vlm_ocr_enable,
         )
+        if keep_page_images:
+            page_info[PAGE_IMAGE_KEY] = image_dict["img_pil"].copy()
         middle_json["pdf_info"].append(page_info)
         if progress_bar is not None:
             progress_bar.update(1)
@@ -221,6 +229,7 @@ def append_page_model_list_to_middle_json(
     _ocr_enable=False,
     _vlm_ocr_enable=False,
     progress_bar=None,
+    keep_page_images=False,
 ):
     append_page_results_to_middle_json(
         middle_json,
@@ -232,19 +241,32 @@ def append_page_model_list_to_middle_json(
         _ocr_enable=_ocr_enable,
         _vlm_ocr_enable=_vlm_ocr_enable,
         progress_bar=progress_bar,
+        keep_page_images=keep_page_images,
     )
 
 
-def finalize_middle_json(pdf_info_list, hybrid_pipeline_model, _ocr_enable, _vlm_ocr_enable):
+def finalize_middle_json(
+    pdf_info_list,
+    hybrid_pipeline_model,
+    _ocr_enable,
+    _vlm_ocr_enable,
+    page_images=None,
+    vlm_report_dir=None,
+):
     if not (_vlm_ocr_enable or _ocr_enable):
         _apply_post_ocr(pdf_info_list, hybrid_pipeline_model)
 
     build_para_blocks_from_preproc(pdf_info_list)
-    annotate_hybrid_cross_page_merge_prev(
-        pdf_info_list,
-        prefer_edge_line_hints=_vlm_ocr_enable,
-    )
-    merge_para_text_blocks(pdf_info_list, allow_cross_page=True)
+    if vlm_cross_page_text_merge_enabled():
+        page_images = page_images or [page_info.get(PAGE_IMAGE_KEY) for page_info in pdf_info_list]
+        apply_vlm_cross_page_text_merge(pdf_info_list, page_images=page_images, report_dir=vlm_report_dir)
+        merge_para_text_blocks(pdf_info_list, allow_cross_page=False)
+    else:
+        annotate_hybrid_cross_page_merge_prev(
+            pdf_info_list,
+            prefer_edge_line_hints=_vlm_ocr_enable,
+        )
+        merge_para_text_blocks(pdf_info_list, allow_cross_page=True)
 
     table_enable = get_table_enable(os.getenv('MINERU_VLM_TABLE_ENABLE', 'True').lower() == 'true')
     if table_enable:
@@ -256,6 +278,13 @@ def finalize_middle_json(pdf_info_list, hybrid_pipeline_model, _ocr_enable, _vlm
         logger.info(f'llm aided title time: {round(time.time() - llm_aided_title_start_time, 2)}')
 
     cleanup_internal_para_block_metadata(pdf_info_list)
+    for page_info in pdf_info_list:
+        page_image = page_info.pop(PAGE_IMAGE_KEY, None)
+        if page_image is not None:
+            try:
+                page_image.close()
+            except Exception:
+                pass
 
 
 def _detect_edge_text_line_hints(page_blocks, page_pil_img, scale):
@@ -319,6 +348,7 @@ def result_to_middle_json(
         _ocr_enable,
         _vlm_ocr_enable,
         hybrid_pipeline_model,
+        vlm_report_dir=None,
 ):
     middle_json = init_middle_json(_ocr_enable, _vlm_ocr_enable)
 
@@ -332,6 +362,7 @@ def result_to_middle_json(
             _ocr_enable=_ocr_enable,
             _vlm_ocr_enable=_vlm_ocr_enable,
             progress_bar=progress_bar,
+            keep_page_images=vlm_cross_page_text_merge_enabled(),
         )
 
     finalize_middle_json(
@@ -339,6 +370,7 @@ def result_to_middle_json(
         hybrid_pipeline_model,
         _ocr_enable,
         _vlm_ocr_enable,
+        vlm_report_dir=vlm_report_dir,
     )
     close_pdfium_document(pdf_doc)
     return middle_json

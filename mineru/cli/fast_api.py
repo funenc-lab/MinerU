@@ -638,6 +638,21 @@ def create_result_zip(
                             pdf_name,
                             parse_dir,
                             path.name,
+                            ),
+                        )
+
+            cross_page_text_vlm_report_dir = Path(parse_dir) / "cross_page_text_vlm_report"
+            if cross_page_text_vlm_report_dir.is_dir():
+                for path in sorted(cross_page_text_vlm_report_dir.rglob("*")):
+                    if not path.is_file():
+                        continue
+                    relative_path = path.relative_to(parse_dir)
+                    zf.write(
+                        str(path),
+                        arcname=build_zip_arcname(
+                            pdf_name,
+                            parse_dir,
+                            str(relative_path),
                         ),
                     )
     return zip_path
