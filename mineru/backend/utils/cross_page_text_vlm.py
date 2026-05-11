@@ -38,7 +38,7 @@ SKIP_TOP_TYPES = {
     BlockType.INTERLINE_EQUATION,
     BlockType.CODE,
 }
-PROMPT_VERSION = "vlm_layout_text_adjudicate_v2"
+PROMPT_VERSION = "vlm_feature_scoring_v1"
 DEFAULT_MODEL = "qwen/qwen3.6-27b"
 DEFAULT_API_URL = "http://127.0.0.1:1234/v1/chat/completions"
 RENDER_SCALE = 2.0
@@ -58,14 +58,13 @@ Data source note:
 - This is the original page-level block stream after OCR/image replacement and before para_blocks text/table merging.
 - Do not infer from markdown or any already merged/deleted output.
 
-This system uses a three-stage VLM chain:
-1. layout_filter: judge body-X alignment and whether B starts a new paragraph/list/clause/heading/label block.
-2. text_continuity: judge whether A and B read as continuous text in the same body flow.
-3. adjudication: combine stage results into the final merge JSON.
+This system uses a two-stage VLM chain:
+1. feature_extract: observe compact marker, body-X, and body-flow features.
+2. scoring: score merge and new-unit evidence from those features.
 
-The final adjudication decides whether B should be appended directly to A as the same text block.
+Python normalization applies deterministic hard rules after scoring.
 
-Output fields:
+Final output fields:
 - is_continuation: boolean
 - confidence: number from 0 to 1
 - target: "previous_leaf" if true, otherwise "none"
@@ -74,134 +73,65 @@ Output fields:
 - joined_preview: string, maximum 240 characters, no newline characters
 - b_starts_new_unit: boolean, true when B starts a separate text block/document unit relative to A
 - same_list_item_body: boolean, true when the local repeated-item structure shows B continues the same item body
-- decision_basis: short reason consistent with is_continuation, maximum 120 characters
+- decision_basis: short reason consistent with is_continuation, maximum 240 characters
 
 Metadata:
 {metadata}
 """
 
-LAYOUT_FILTER_PROMPT_TEMPLATE = """You are stage 1 of cross-page text merging: the layout and identifier filter.
+FEATURE_PROMPT_TEMPLATE = """You are stage 1 of cross-page text merging: feature extraction.
 Return exactly one JSON object matching the schema. Do not output any other text.
 
-Task: judge only whether B looks like the start of a new text block. Do not make the final merge decision.
+Task: observe compact features only. Do not make the final merge decision and do not include free-text evidence.
 
-Check:
-- Whether A's continued body-text start X and B's first body-text start X are approximately aligned. Compare the prose body-text start X, not the identifier, bullet, clause number, or label X.
-- Whether A is only a heading, label, or container name while B is its body text.
-- Whether B starts a new paragraph.
-- Whether B introduces a new list number, clause number, bullet, heading, or label.
-- If B has a new identifier, classify it as sibling, child, parent, heading, label, or unclear.
-
-Hard constraints:
-- If B has a new list number, clause number, bullet, heading, or label, set b_has_new_list_or_clause_marker=true.
-- If new_marker_type is sibling, child, parent, heading, or label, set b_starts_new_block_by_layout=true, unless the identifier itself is visibly split by the page break.
-- If A is a heading, label, or container name and B is its body text, set new_marker_type=\"heading\" or \"label\" and b_starts_new_block_by_layout=true.
-- Approximate body-X alignment cannot override a new explicit identifier, heading, or label.
-- For numbered/list items, ignore the marker column when estimating body-X alignment. B can be aligned with A's prose body even when A's full bbox starts farther left because it includes the marker.
-- A page-top paragraph with no new identifier is not a new block merely because its X is shifted from A's full bbox; first compare B with A's prose body-text start X.
-
-Notes:
-- Page top position, capitalization, proper nouns, technical terms, sentence-like starts, and topic shifts are not sufficient new-block evidence.
-- Inline comma/semicolon enumerated objects inside the same sentence or list body are not separate document blocks.
-- Use only red-box text, Metadata OCR, and bboxes.
+Feature rules:
+- marker_role describes whether B starts with a new structural anchor and what role it has.
+- Describe markers by function, not concrete syntax. A marker is any visually or textually distinct prefix at the beginning of B that establishes B as a separate document unit rather than body continuation.
+- Use marker_role="none" only when B clearly has no new explicit structural marker.
+- Use marker_role="unclear" when you cannot reliably decide whether B has a structural marker or what role it has.
+- body_x compares A's body-text start X with B's body-text start X.
+- If A has a marker, item identifier, bullet, clause prefix, or label prefix, ignore that marker column and compare the prose/body start X.
+- body_flow describes whether A and B read like the same body flow.
+- A can be textually closed and still have body_flow="same" when B is a later sentence or paragraph in the same body unit.
+- A's closed punctuation or complete sentence ending must not affect body_x.
+- Page top position alone is not a structural marker.
 
 Output fields:
-- body_x_alignment: "aligned" | "shifted" | "unclear"
-- b_has_new_paragraph_start: boolean
-- b_has_new_list_or_clause_marker: boolean
-- new_marker_type: "none" | "sibling" | "child" | "parent" | "heading" | "label" | "unclear"
-- b_starts_new_block_by_layout: boolean
-- evidence: short reason
+- marker_role: "none" | "sibling" | "child" | "parent" | "heading" | "label" | "independent_item" | "unclear"
+- body_x: "aligned" | "not_aligned" | "unclear"
+- body_flow: "same" | "different" | "unclear"
 
 Metadata:
 {metadata}
 """
 
-TEXT_CONTINUITY_PROMPT_TEMPLATE = """You are stage 2 of cross-page text merging: the text-continuity judge.
+SCORING_PROMPT_TEMPLATE = """You are stage 2 of cross-page text merging: percent scoring.
 Return exactly one JSON object matching the schema. Do not output any other text.
 
-Task: judge only whether the body text in A and B is continuous. Do not make the final structural veto for new lists or clauses.
+Task: score whether B should be appended directly to A using the feature extraction result and metadata.
 
-Check:
-- Whether A is textually unclosed, such as ending with a comma, semicolon, connector, preposition, open phrase, or unfinished list body.
-- Whether B supplies A's missing object, complement, modifier, following body text, or same-item body.
-- Whether A and B look like body text governed by the same explicit identifier.
-- Whether A and B are consecutive body paragraphs/sentences under the same numbered/list item.
-- Whether B is only an inline enumeration continuation inside the same sentence or list body.
-- Whether A and B form a split proper name, acronym, domain-specific term, location, or noun phrase.
-- Whether A ends with a verb, preposition, or connector that needs an object/complement and B starts with the noun phrase that supplies it.
+Score semantics:
+- merge_score is an integer 0-100 for how strongly B should be appended to A.
+- new_unit_score is an integer 0-100 for how strongly B is a new structural unit.
+- The two scores do not need to sum to 100.
+- 0-30 means weak evidence, 31-69 means uncertain or mixed evidence, 70-89 means likely, and 90-100 means strong evidence.
 
-Hard constraints:
-- A page break may split the body of one numbered/list item into multiple paragraphs or sentences. If A belongs to a numbered/list item and B has no explicit new list/clause/heading/label marker, treat B as same_body_flow=true when B reads as additional body text of the same item, even if A ends with a complete sentence and B starts a new sentence.
-- A clause/list number at the beginning of A does not by itself make A a heading or container. If the marker is followed by prose body text, treat A as a numbered item body unless visual layout clearly shows it is only a standalone heading or label.
-- If A is a heading, label, or container name and B is its body text, the relation is structural, not body-text continuity; set same_body_flow=false.
-- If A is only a list lead-in and B is the first child item after it, the relation is hierarchical, not same_body_flow; set same_body_flow=false.
-- If B introduces a new child, sibling, or parent identifier, do not set same_body_flow=true merely because the content is semantically related or expands the topic.
-- Only inline comma/semicolon enumerated objects may be inline_enumeration. Child items with explicit list/clause markers are not inline_enumeration.
-- If A is textually unclosed and B has no explicit new list/clause/heading/label marker, default to same_body_flow=true unless A is a heading/label/container or B is clearly a child item.
-- If A belongs to a numbered/list item and B has no explicit new marker, do not reject same_body_flow merely because A ends with a period, B starts with a capital letter, or B appears at the top of the next page.
-- If A ends with a comma or semicolon, B has no explicit new identifier, and B names the next object in the same sentence enumeration, set same_body_flow=true and continuation_type=\"inline_enumeration\".
-- If A ends with an incomplete term or noun phrase and B completes that term or noun phrase, set same_body_flow=true.
-- If A ends with a verb or prepositional structure that needs an object and B starts with a noun phrase that supplies it, set same_body_flow=true.
-- If A ends with an acronym, proper noun, or domain-specific term and B starts with an entity, role, location, component, qualifier, or other noun-phrase continuation, and together they can form one domain-specific noun phrase, set same_body_flow=true.
-- If A ends with a comma and B starts with a noun phrase, and B has no explicit list/clause/heading/label marker, prefer treating B as the same sentence enumeration instead of a new sentence.
-- If A ends with an open predicate or verb phrase and B starts with a noun phrase, acronym, domain-specific term, or proper noun, first judge whether B supplies A's object/content, even if B later contains a finite verb.
-- Do not reject continuity merely because B itself looks like a complete sentence, contains a finite verb, introduces a new proper noun, or looks like a new paragraph.
-
-Notes:
-- Do not reject continuity merely because B is on a new page, looks like a new paragraph, starts with capitalization, contains proper nouns/technical terms, or shifts topic.
-- Use only red-box text, Metadata OCR, and bboxes.
+Scoring rules:
+- Explicit marker_role values other than none or unclear are strong new-unit evidence.
+- marker_role="none" plus body_x="aligned" is the strongest merge evidence.
+- body_flow is supporting evidence.
+- body_x="unclear" is insufficient for default merge.
+- A's closed punctuation or complete sentence ending is weak evidence only, never a standalone no-merge reason.
+- Do not override the extracted feature values. Score from them.
 
 Output fields:
-- a_is_textually_unclosed: boolean
-- b_completes_a: boolean
-- same_body_flow: boolean
-- continuation_type: "same_identifier_body" | "unfinished_phrase" | "inline_enumeration" | "same_item_body" | "none" | "unclear"
-- evidence: short reason
+- merge_score: integer from 0 to 100
+- new_unit_score: integer from 0 to 100
+- decision: "merge" | "no_merge" | "unknown"
+- reason: short reason, maximum 240 characters
 
-Metadata:
-{metadata}
-"""
-
-ADJUDICATION_PROMPT_TEMPLATE = """You are stage 3 of cross-page text merging: the final adjudicator.
-Return exactly one JSON object matching the schema. Do not output any other text.
-
-Task: use the layout/identifier filter result and the text-continuity result to decide whether B should be appended directly to A.
-
-Adjudication rules:
-1. If layout_filter.new_marker_type is sibling, child, parent, heading, or label, do not merge unless the identifier itself is visibly split by the page break.
-2. If layout_filter.b_has_new_list_or_clause_marker=true and new_marker_type is not none, do not merge.
-3. If layout_filter.new_marker_type=\"none\" and text_continuity.a_is_textually_unclosed=true, merge. Page top position, new paragraph appearance, body-X shift, capitalization, new proper nouns, and complete-sentence appearance cannot veto the merge.
-4. If layout_filter.new_marker_type=\"none\" and text_continuity.same_body_flow=true, merge.
-5. If B has no explicit new marker and appears to continue the body of A's same numbered/list item, merge even if text_continuity.a_is_textually_unclosed=false.
-6. If text_continuity shows unfinished_phrase, inline_enumeration, same_identifier_body, or same_item_body, and B has no new list/clause/heading/label marker, merge.
-7. If text_continuity.a_is_textually_unclosed=false and text_continuity.same_body_flow=false, and layout_filter.b_starts_new_block_by_layout=true, do not merge.
-8. If layout_filter only finds page top position, new paragraph appearance, capitalization, sentence-like start, proper nouns, technical terms, topic shift, or body-X shift, that is not sufficient new-block evidence.
-9. If the two stages conflict, prefer explicit identifiers. Without explicit identifiers, prefer textual unclosedness, same-item body continuation, and text continuity.
-
-Required checks:
-- Copy A's last line into a_last_line.
-- Copy B's first line into b_first_line.
-- joined_preview must be a newline-free local A+B preview.
-- For merge_false, decision_basis must cite positive new-block evidence.
-- All output fields must be mutually consistent.
-
-Output fields:
-- is_continuation: boolean
-- confidence: number from 0 to 1
-- target: "previous_leaf" when true, otherwise "none"
-- a_last_line: string
-- b_first_line: string
-- joined_preview: string, maximum 240 characters, no newline characters
-- b_starts_new_unit: boolean
-- same_list_item_body: boolean
-- decision_basis: short reason
-
-Layout filter result:
-{layout_decision}
-
-Text continuity result:
-{text_decision}
+Feature extraction result:
+{features}
 
 Metadata:
 {metadata}
@@ -241,69 +171,51 @@ SCHEMA = {
     },
 }
 
-LAYOUT_FILTER_SCHEMA = {
+FEATURE_SCHEMA = {
     "type": "json_schema",
     "json_schema": {
-        "name": "hybrid_cross_page_layout_filter",
+        "name": "hybrid_cross_page_feature_extract",
         "strict": True,
         "schema": {
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "body_x_alignment": {"type": "string", "enum": ["aligned", "shifted", "unclear"]},
-                "b_has_new_paragraph_start": {"type": "boolean"},
-                "b_has_new_list_or_clause_marker": {"type": "boolean"},
-                "new_marker_type": {
+                "marker_role": {
                     "type": "string",
-                    "enum": ["none", "sibling", "child", "parent", "heading", "label", "unclear"],
+                    "enum": [
+                        "none",
+                        "sibling",
+                        "child",
+                        "parent",
+                        "heading",
+                        "label",
+                        "independent_item",
+                        "unclear",
+                    ],
                 },
-                "b_starts_new_block_by_layout": {"type": "boolean"},
-                "evidence": {"type": "string", "maxLength": 240},
+                "body_x": {"type": "string", "enum": ["aligned", "not_aligned", "unclear"]},
+                "body_flow": {"type": "string", "enum": ["same", "different", "unclear"]},
             },
-            "required": [
-                "body_x_alignment",
-                "b_has_new_paragraph_start",
-                "b_has_new_list_or_clause_marker",
-                "new_marker_type",
-                "b_starts_new_block_by_layout",
-                "evidence",
-            ],
+            "required": ["marker_role", "body_x", "body_flow"],
         },
     },
 }
 
-TEXT_CONTINUITY_SCHEMA = {
+SCORING_SCHEMA = {
     "type": "json_schema",
     "json_schema": {
-        "name": "hybrid_cross_page_text_continuity",
+        "name": "hybrid_cross_page_scoring",
         "strict": True,
         "schema": {
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "a_is_textually_unclosed": {"type": "boolean"},
-                "b_completes_a": {"type": "boolean"},
-                "same_body_flow": {"type": "boolean"},
-                "continuation_type": {
-                    "type": "string",
-                    "enum": [
-                        "same_identifier_body",
-                        "unfinished_phrase",
-                        "inline_enumeration",
-                        "same_item_body",
-                        "none",
-                        "unclear",
-                    ],
-                },
-                "evidence": {"type": "string", "maxLength": 240},
+                "merge_score": {"type": "integer", "minimum": 0, "maximum": 100},
+                "new_unit_score": {"type": "integer", "minimum": 0, "maximum": 100},
+                "decision": {"type": "string", "enum": ["merge", "no_merge", "unknown"]},
+                "reason": {"type": "string", "maxLength": 240},
             },
-            "required": [
-                "a_is_textually_unclosed",
-                "b_completes_a",
-                "same_body_flow",
-                "continuation_type",
-                "evidence",
-            ],
+            "required": ["merge_score", "new_unit_score", "decision", "reason"],
         },
     },
 }
@@ -1105,6 +1017,8 @@ def _validate_model_json(decision, response_schema):
             raise ValueError(f"model response field {field} must be boolean")
         if expected_type == "number" and not isinstance(value, (int, float)):
             raise ValueError(f"model response field {field} must be number")
+        if expected_type == "integer" and not isinstance(value, int):
+            raise ValueError(f"model response field {field} must be integer")
         if expected_type == "string" and not isinstance(value, str):
             raise ValueError(f"model response field {field} must be string")
         enum = field_schema.get("enum")
