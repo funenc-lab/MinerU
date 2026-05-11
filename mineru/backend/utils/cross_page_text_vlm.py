@@ -38,13 +38,16 @@ SKIP_TOP_TYPES = {
     BlockType.INTERLINE_EQUATION,
     BlockType.CODE,
 }
-PROMPT_VERSION = "generic_direct_append_v3"
+PROMPT_VERSION = "vlm_layout_text_adjudicate_v2"
 DEFAULT_MODEL = "qwen/qwen3.6-27b"
 DEFAULT_API_URL = "http://127.0.0.1:1234/v1/chat/completions"
 RENDER_SCALE = 2.0
 PAGE_IMAGE_KEY = "_cross_page_text_vlm_page_image"
 REQUEST_RETRY_DELAYS_SECONDS = tuple(range(1, 9))
 DEFAULT_REQUEST_CONCURRENCY = 3
+TEMPLATE_DIR = Path(__file__).resolve().parents[2] / "resources" / "templates"
+REPORT_TEMPLATE_PATH = TEMPLATE_DIR / "cross_page_text_vlm_report.html"
+REPORT_CARD_TEMPLATE_PATH = TEMPLATE_DIR / "cross_page_text_vlm_report_card.html"
 
 
 PROMPT_TEMPLATE = """You are a page-break MERGE judge for document reconstruction.
@@ -55,43 +58,12 @@ Data source note:
 - This is the original page-level block stream after OCR/image replacement and before para_blocks text/table merging.
 - Do not infer from markdown or any already merged/deleted output.
 
-Core definition:
-- The task is direct text append, not outline grouping.
-- merge_true means B must be appended directly to A with no block or paragraph boundary between them.
-- merge_false means A and B should remain separate text blocks, even if they belong to the same topic, section, requirement, or parent structure.
+This system uses a three-stage VLM chain:
+1. layout_filter: judge body-X alignment and whether B starts a new paragraph/list/clause/heading/label block.
+2. text_continuity: judge whether A and B read as continuous text in the same body flow.
+3. adjudication: combine stage results into the final merge JSON.
 
-Generic decision principles:
-1. A physical page break is not a reading boundary.
-2. Weak surface cues are never decisive by themselves: punctuation at the end of A, capitalization at the start of B, proper nouns, technical terms, a new sentence form, a changed topic word, or a line that looks complete.
-3. A period or other sentence-ending punctuation is not proof that A is complete. One paragraph, requirement, explanation, or item body may contain multiple sentences across pages.
-4. Same topic, same section, parent-child relation, or heading-followed-by-body relation is not enough for merge_true.
-5. Return merge_true only when A and B form one continuous text-bearing unit that would be wrong if separated by a block boundary.
-6. Return merge_false when A is a standalone label, heading, container name, or structural parent and B is content under it; such content is related but not appended to the label text.
-7. For repeated item structures, decide whether B continues the same item body or starts a different item from structure and reading flow. Do not merge different items, and do not reject a same-item continuation merely because the surrounding structure repeats.
-8. A sibling item is not direct text append to the previous item. Parent-to-child item transitions are grouping relations, not direct text append. Do not treat adjacent list items as one continuation just because they are consecutive, coordinated, or connected by local wording.
-9. When evidence is ambiguous and B has no independent new-unit start, choose merge_true with lower confidence only if direct append would preserve the local text flow better than keeping a boundary.
-
-Prohibited decision basis:
-- Do not cite punctuation, uppercase/lowercase, proper nouns, technical terms, page start, or "new sentence" as the deciding reason.
-- Do not rely on fixed phrase patterns or hard-coded examples. Judge the actual local visual structure and semantic continuity.
-- Do not justify merge_true only by saying B belongs under A's heading or in the same section.
-- Do not justify merge_true only by saying B is the next coordinated/listed item after A.
-- For merge_false, decision_basis must cite positive local structural evidence that B starts a separate block.
-- If the only evidence for merge_false is punctuation, a sentence-looking start, semantic completeness, or a topic shift without a visible structural marker, revise to merge_true when direct append preserves text flow.
-
-Evidence rules:
-1. Use only red-box text and Metadata OCR.
-2. Do not use red-box outside text.
-3. Do not reject continuation merely because B starts a new physical page.
-4. The final boolean must match the reason.
-5. decision_basis must be written in Chinese, short, and must not include step-by-step hidden reasoning.
-
-Required checks:
-- Copy A's last line into a_last_line.
-- Copy B's first line into b_first_line.
-- Determine whether B should be directly appended to A, not merely grouped under A.
-- Determine whether joined_preview is a continuous text-bearing unit without a block boundary.
-- If B has no visible structural marker and the only concern is that A looks complete or B starts a new sentence, do not mark B as a new unit.
+The final adjudication decides whether B should be appended directly to A as the same text block.
 
 Output fields:
 - is_continuation: boolean
@@ -102,7 +74,134 @@ Output fields:
 - joined_preview: string, maximum 240 characters, no newline characters
 - b_starts_new_unit: boolean, true when B starts a separate text block/document unit relative to A
 - same_list_item_body: boolean, true when the local repeated-item structure shows B continues the same item body
-- decision_basis: Chinese short reason consistent with is_continuation, maximum 120 Chinese characters
+- decision_basis: short reason consistent with is_continuation, maximum 120 characters
+
+Metadata:
+{metadata}
+"""
+
+LAYOUT_FILTER_PROMPT_TEMPLATE = """You are stage 1 of cross-page text merging: the layout and identifier filter.
+Return exactly one JSON object matching the schema. Do not output any other text.
+
+Task: judge only whether B looks like the start of a new text block. Do not make the final merge decision.
+
+Check:
+- Whether A's continued body-text start X and B's first body-text start X are approximately aligned. Compare the prose body-text start X, not the identifier, bullet, clause number, or label X.
+- Whether A is only a heading, label, or container name while B is its body text.
+- Whether B starts a new paragraph.
+- Whether B introduces a new list number, clause number, bullet, heading, or label.
+- If B has a new identifier, classify it as sibling, child, parent, heading, label, or unclear.
+
+Hard constraints:
+- If B has a new list number, clause number, bullet, heading, or label, set b_has_new_list_or_clause_marker=true.
+- If new_marker_type is sibling, child, parent, heading, or label, set b_starts_new_block_by_layout=true, unless the identifier itself is visibly split by the page break.
+- If A is a heading, label, or container name and B is its body text, set new_marker_type=\"heading\" or \"label\" and b_starts_new_block_by_layout=true.
+- Approximate body-X alignment cannot override a new explicit identifier, heading, or label.
+- For numbered/list items, ignore the marker column when estimating body-X alignment. B can be aligned with A's prose body even when A's full bbox starts farther left because it includes the marker.
+- A page-top paragraph with no new identifier is not a new block merely because its X is shifted from A's full bbox; first compare B with A's prose body-text start X.
+
+Notes:
+- Page top position, capitalization, proper nouns, technical terms, sentence-like starts, and topic shifts are not sufficient new-block evidence.
+- Inline comma/semicolon enumerated objects inside the same sentence or list body are not separate document blocks.
+- Use only red-box text, Metadata OCR, and bboxes.
+
+Output fields:
+- body_x_alignment: "aligned" | "shifted" | "unclear"
+- b_has_new_paragraph_start: boolean
+- b_has_new_list_or_clause_marker: boolean
+- new_marker_type: "none" | "sibling" | "child" | "parent" | "heading" | "label" | "unclear"
+- b_starts_new_block_by_layout: boolean
+- evidence: short reason
+
+Metadata:
+{metadata}
+"""
+
+TEXT_CONTINUITY_PROMPT_TEMPLATE = """You are stage 2 of cross-page text merging: the text-continuity judge.
+Return exactly one JSON object matching the schema. Do not output any other text.
+
+Task: judge only whether the body text in A and B is continuous. Do not make the final structural veto for new lists or clauses.
+
+Check:
+- Whether A is textually unclosed, such as ending with a comma, semicolon, connector, preposition, open phrase, or unfinished list body.
+- Whether B supplies A's missing object, complement, modifier, following body text, or same-item body.
+- Whether A and B look like body text governed by the same explicit identifier.
+- Whether A and B are consecutive body paragraphs/sentences under the same numbered/list item.
+- Whether B is only an inline enumeration continuation inside the same sentence or list body.
+- Whether A and B form a split proper name, acronym, domain-specific term, location, or noun phrase.
+- Whether A ends with a verb, preposition, or connector that needs an object/complement and B starts with the noun phrase that supplies it.
+
+Hard constraints:
+- A page break may split the body of one numbered/list item into multiple paragraphs or sentences. If A belongs to a numbered/list item and B has no explicit new list/clause/heading/label marker, treat B as same_body_flow=true when B reads as additional body text of the same item, even if A ends with a complete sentence and B starts a new sentence.
+- A clause/list number at the beginning of A does not by itself make A a heading or container. If the marker is followed by prose body text, treat A as a numbered item body unless visual layout clearly shows it is only a standalone heading or label.
+- If A is a heading, label, or container name and B is its body text, the relation is structural, not body-text continuity; set same_body_flow=false.
+- If A is only a list lead-in and B is the first child item after it, the relation is hierarchical, not same_body_flow; set same_body_flow=false.
+- If B introduces a new child, sibling, or parent identifier, do not set same_body_flow=true merely because the content is semantically related or expands the topic.
+- Only inline comma/semicolon enumerated objects may be inline_enumeration. Child items with explicit list/clause markers are not inline_enumeration.
+- If A is textually unclosed and B has no explicit new list/clause/heading/label marker, default to same_body_flow=true unless A is a heading/label/container or B is clearly a child item.
+- If A belongs to a numbered/list item and B has no explicit new marker, do not reject same_body_flow merely because A ends with a period, B starts with a capital letter, or B appears at the top of the next page.
+- If A ends with a comma or semicolon, B has no explicit new identifier, and B names the next object in the same sentence enumeration, set same_body_flow=true and continuation_type=\"inline_enumeration\".
+- If A ends with an incomplete term or noun phrase and B completes that term or noun phrase, set same_body_flow=true.
+- If A ends with a verb or prepositional structure that needs an object and B starts with a noun phrase that supplies it, set same_body_flow=true.
+- If A ends with an acronym, proper noun, or domain-specific term and B starts with an entity, role, location, component, qualifier, or other noun-phrase continuation, and together they can form one domain-specific noun phrase, set same_body_flow=true.
+- If A ends with a comma and B starts with a noun phrase, and B has no explicit list/clause/heading/label marker, prefer treating B as the same sentence enumeration instead of a new sentence.
+- If A ends with an open predicate or verb phrase and B starts with a noun phrase, acronym, domain-specific term, or proper noun, first judge whether B supplies A's object/content, even if B later contains a finite verb.
+- Do not reject continuity merely because B itself looks like a complete sentence, contains a finite verb, introduces a new proper noun, or looks like a new paragraph.
+
+Notes:
+- Do not reject continuity merely because B is on a new page, looks like a new paragraph, starts with capitalization, contains proper nouns/technical terms, or shifts topic.
+- Use only red-box text, Metadata OCR, and bboxes.
+
+Output fields:
+- a_is_textually_unclosed: boolean
+- b_completes_a: boolean
+- same_body_flow: boolean
+- continuation_type: "same_identifier_body" | "unfinished_phrase" | "inline_enumeration" | "same_item_body" | "none" | "unclear"
+- evidence: short reason
+
+Metadata:
+{metadata}
+"""
+
+ADJUDICATION_PROMPT_TEMPLATE = """You are stage 3 of cross-page text merging: the final adjudicator.
+Return exactly one JSON object matching the schema. Do not output any other text.
+
+Task: use the layout/identifier filter result and the text-continuity result to decide whether B should be appended directly to A.
+
+Adjudication rules:
+1. If layout_filter.new_marker_type is sibling, child, parent, heading, or label, do not merge unless the identifier itself is visibly split by the page break.
+2. If layout_filter.b_has_new_list_or_clause_marker=true and new_marker_type is not none, do not merge.
+3. If layout_filter.new_marker_type=\"none\" and text_continuity.a_is_textually_unclosed=true, merge. Page top position, new paragraph appearance, body-X shift, capitalization, new proper nouns, and complete-sentence appearance cannot veto the merge.
+4. If layout_filter.new_marker_type=\"none\" and text_continuity.same_body_flow=true, merge.
+5. If B has no explicit new marker and appears to continue the body of A's same numbered/list item, merge even if text_continuity.a_is_textually_unclosed=false.
+6. If text_continuity shows unfinished_phrase, inline_enumeration, same_identifier_body, or same_item_body, and B has no new list/clause/heading/label marker, merge.
+7. If text_continuity.a_is_textually_unclosed=false and text_continuity.same_body_flow=false, and layout_filter.b_starts_new_block_by_layout=true, do not merge.
+8. If layout_filter only finds page top position, new paragraph appearance, capitalization, sentence-like start, proper nouns, technical terms, topic shift, or body-X shift, that is not sufficient new-block evidence.
+9. If the two stages conflict, prefer explicit identifiers. Without explicit identifiers, prefer textual unclosedness, same-item body continuation, and text continuity.
+
+Required checks:
+- Copy A's last line into a_last_line.
+- Copy B's first line into b_first_line.
+- joined_preview must be a newline-free local A+B preview.
+- For merge_false, decision_basis must cite positive new-block evidence.
+- All output fields must be mutually consistent.
+
+Output fields:
+- is_continuation: boolean
+- confidence: number from 0 to 1
+- target: "previous_leaf" when true, otherwise "none"
+- a_last_line: string
+- b_first_line: string
+- joined_preview: string, maximum 240 characters, no newline characters
+- b_starts_new_unit: boolean
+- same_list_item_body: boolean
+- decision_basis: short reason
+
+Layout filter result:
+{layout_decision}
+
+Text continuity result:
+{text_decision}
 
 Metadata:
 {metadata}
@@ -137,6 +236,73 @@ SCHEMA = {
                 "b_starts_new_unit",
                 "same_list_item_body",
                 "decision_basis",
+            ],
+        },
+    },
+}
+
+LAYOUT_FILTER_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "hybrid_cross_page_layout_filter",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "body_x_alignment": {"type": "string", "enum": ["aligned", "shifted", "unclear"]},
+                "b_has_new_paragraph_start": {"type": "boolean"},
+                "b_has_new_list_or_clause_marker": {"type": "boolean"},
+                "new_marker_type": {
+                    "type": "string",
+                    "enum": ["none", "sibling", "child", "parent", "heading", "label", "unclear"],
+                },
+                "b_starts_new_block_by_layout": {"type": "boolean"},
+                "evidence": {"type": "string", "maxLength": 240},
+            },
+            "required": [
+                "body_x_alignment",
+                "b_has_new_paragraph_start",
+                "b_has_new_list_or_clause_marker",
+                "new_marker_type",
+                "b_starts_new_block_by_layout",
+                "evidence",
+            ],
+        },
+    },
+}
+
+TEXT_CONTINUITY_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "hybrid_cross_page_text_continuity",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "a_is_textually_unclosed": {"type": "boolean"},
+                "b_completes_a": {"type": "boolean"},
+                "same_body_flow": {"type": "boolean"},
+                "continuation_type": {
+                    "type": "string",
+                    "enum": [
+                        "same_identifier_body",
+                        "unfinished_phrase",
+                        "inline_enumeration",
+                        "same_item_body",
+                        "none",
+                        "unclear",
+                    ],
+                },
+                "evidence": {"type": "string", "maxLength": 240},
+            },
+            "required": [
+                "a_is_textually_unclosed",
+                "b_completes_a",
+                "same_body_flow",
+                "continuation_type",
+                "evidence",
             ],
         },
     },
@@ -514,10 +680,31 @@ def _prompt_for_candidate(candidate):
     return PROMPT_TEMPLATE.format(metadata=json.dumps(candidate["metadata"], ensure_ascii=False, indent=2))
 
 
+def _layout_filter_prompt_for_candidate(candidate):
+    return LAYOUT_FILTER_PROMPT_TEMPLATE.format(
+        metadata=json.dumps(candidate["metadata"], ensure_ascii=False, indent=2)
+    )
+
+
+def _text_continuity_prompt_for_candidate(candidate):
+    return TEXT_CONTINUITY_PROMPT_TEMPLATE.format(
+        metadata=json.dumps(candidate["metadata"], ensure_ascii=False, indent=2)
+    )
+
+
+def _adjudication_prompt_for_candidate(candidate, layout_decision, text_decision):
+    return ADJUDICATION_PROMPT_TEMPLATE.format(
+        layout_decision=json.dumps(layout_decision, ensure_ascii=False, indent=2),
+        text_decision=json.dumps(text_decision, ensure_ascii=False, indent=2),
+        metadata=json.dumps(candidate["metadata"], ensure_ascii=False, indent=2),
+    )
+
+
 def _prompt_for_skipped_boundary(candidate):
     return (
-        "未进入VLM判定。\n"
-        "该页边界没有形成可直接合并的文本候选，流程仅保存上下文截图用于人工核查。\n\n"
+        "Skipped VLM judgment.\n"
+        "This page boundary did not produce a direct text-merge candidate; "
+        "the report only keeps the context image for manual inspection.\n\n"
         f"Metadata:\n{json.dumps(candidate['metadata'], ensure_ascii=False, indent=2)}\n"
     )
 
@@ -573,7 +760,7 @@ class _VlmReportWriter:
             "merge_false": self._count("merge_false"),
             "merge_unknown": self._count("merge_unknown"),
             "skipped_boundary": sum(1 for record in self.records if record.get("skip_reason")),
-            "filename_pattern": "页号-页号_是否合并.png",
+            "filename_pattern": "page-page_merge-status.png",
             "image_note": "marked images use red boxes for A previous-page tail and B current-page head",
         }
         (self.report_dir / "summary.json").write_text(
@@ -596,80 +783,17 @@ class _VlmReportWriter:
 def _render_report_html(summary, records, report_dir):
     cards = "\n".join(_render_report_card(record, report_dir) for record in records)
     summary_json = html.escape(json.dumps(summary, ensure_ascii=False, indent=2))
-    return f"""<!doctype html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Cross Page Text VLM Report</title>
-<style>
-body {{ margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #1f2933; background: #f6f7f9; }}
-header {{ padding: 20px 24px 12px; background: #fff; border-bottom: 1px solid #d9dee7; position: sticky; top: 0; z-index: 2; }}
-h1 {{ margin: 0 0 10px; font-size: 22px; }}
-.summary {{ display: flex; flex-wrap: wrap; gap: 10px; font-size: 13px; }}
-.summary span {{ background: #eef2f7; border: 1px solid #d9dee7; border-radius: 6px; padding: 6px 9px; }}
-.tabs {{ margin-top: 12px; display: flex; gap: 8px; flex-wrap: wrap; }}
-.tabs button {{ border: 1px solid #b8c0cc; background: #fff; border-radius: 6px; padding: 7px 11px; cursor: pointer; }}
-.tabs button.active {{ background: #263445; color: #fff; border-color: #263445; }}
-main {{ padding: 18px 24px 28px; }}
-.grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }}
-.card {{ background: #fff; border: 1px solid #d9dee7; border-radius: 8px; overflow: hidden; }}
-.card.merge_true {{ border-left: 6px solid #168a4a; }}
-.card.merge_false {{ border-left: 6px solid #b45309; }}
-.card.merge_unknown {{ border-left: 6px solid #7b8794; }}
-.card-header {{ padding: 12px 14px; border-bottom: 1px solid #e5e9f0; display: flex; justify-content: space-between; gap: 12px; }}
-.pair {{ font-weight: 700; }}
-.status {{ font-size: 12px; border-radius: 999px; padding: 3px 8px; background: #eef2f7; }}
-.body {{ padding: 12px 14px; }}
-img {{ width: 100%; height: auto; display: block; border: 1px solid #e5e9f0; border-radius: 6px; background: #fff; }}
-.reason {{ margin: 10px 0 8px; line-height: 1.5; }}
-.meta {{ font-size: 12px; color: #52606d; line-height: 1.45; }}
-.prompt summary {{ margin-top: 8px; cursor: pointer; font-size: 12px; color: #1f5fbf; }}
-pre {{ white-space: pre-wrap; word-break: break-word; background: #f3f5f8; border-radius: 6px; padding: 10px; font-size: 12px; }}
-a {{ color: #1f5fbf; }}
-@media (max-width: 980px) {{ .grid {{ grid-template-columns: 1fr; }} }}
-</style>
-</head>
-<body>
-<header>
-<h1>跨页文本 VLM 判定报告</h1>
-<div class="summary">
-<span>总数 {summary["total"]}</span>
-<span>合并 {summary["merge_true"]}</span>
-<span>未合并 {summary["merge_false"]}</span>
-<span>未知 {summary["merge_unknown"]}</span>
-<span>模型 {html.escape(str(summary["model"]))}</span>
-<span>提示词 {html.escape(str(summary["prompt_template"]))}</span>
-</div>
-<div class="tabs">
-<button class="active" data-filter="all">全部</button>
-<button data-filter="merge_true">合并</button>
-<button data-filter="merge_false">未合并</button>
-<button data-filter="merge_unknown">未知</button>
-</div>
-</header>
-<main>
-<div class="grid">
-{cards}
-</div>
-<h2>summary.json</h2>
-<pre>{summary_json}</pre>
-</main>
-<script>
-const buttons = document.querySelectorAll(".tabs button");
-const cards = document.querySelectorAll(".card");
-buttons.forEach((button) => button.addEventListener("click", () => {{
-  const filter = button.dataset.filter;
-  buttons.forEach((item) => item.classList.remove("active"));
-  button.classList.add("active");
-  cards.forEach((card) => {{
-    card.style.display = filter === "all" || card.dataset.status === filter ? "" : "none";
-  }});
-}}));
-</script>
-</body>
-</html>
-"""
+    replacements = {
+        "{{TOTAL}}": html.escape(str(summary["total"])),
+        "{{MERGE_TRUE}}": html.escape(str(summary["merge_true"])),
+        "{{MERGE_FALSE}}": html.escape(str(summary["merge_false"])),
+        "{{MERGE_UNKNOWN}}": html.escape(str(summary["merge_unknown"])),
+        "{{MODEL}}": html.escape(str(summary["model"])),
+        "{{PROMPT_TEMPLATE}}": html.escape(str(summary["prompt_template"])),
+        "{{CARDS}}": cards,
+        "{{SUMMARY_JSON}}": summary_json,
+    }
+    return _replace_template_tokens(_read_template(REPORT_TEMPLATE_PATH), replacements)
 
 
 def _render_report_card(record, report_dir):
@@ -682,7 +806,7 @@ def _render_report_card(record, report_dir):
     reason = record.get("error") or decision.get("decision_basis") or ""
     skip_reason = record.get("skip_reason")
     if skip_reason:
-        reason = f"未进入VLM判定: {skip_reason}"
+        reason = f"Skipped VLM judgment: {skip_reason}"
     image_html = ""
     if record.get("marked_image"):
         src = _inline_image_src(report_dir, record["marked_image"]) or record["marked_image"]
@@ -692,23 +816,21 @@ def _render_report_card(record, report_dir):
     if record.get("prompt_file"):
         prompt_text = _read_report_text(report_dir, record["prompt_file"])
         prompt_html = (
-            f'<details class="prompt"><summary>提示词: {html.escape(record["prompt_file"])}</summary>'
+            f'<details class="prompt"><summary>Prompt: {html.escape(record["prompt_file"])}</summary>'
             f'<pre>{html.escape(prompt_text)}</pre></details>'
         )
-    return f"""<article class="card {html.escape(record["merge_status"])}" data-status="{html.escape(record["merge_status"])}">
-<div class="card-header">
-<div class="pair">{html.escape(record["pair"])}</div>
-<div class="status">{_status_label(record["merge_status"])}</div>
-</div>
-<div class="body">
-{image_html}
-<div class="reason">理由: {html.escape(str(reason))}</div>
-<div class="meta">置信度: {html.escape(confidence_text)}</div>
-<div class="meta">A尾行: {html.escape(str(a_line))}</div>
-<div class="meta">B首行: {html.escape(str(b_line))}</div>
-{prompt_html}
-</div>
-</article>"""
+    replacements = {
+        "{{MERGE_STATUS}}": html.escape(record["merge_status"]),
+        "{{PAIR}}": html.escape(record["pair"]),
+        "{{STATUS_LABEL}}": _status_label(record["merge_status"]),
+        "{{IMAGE_HTML}}": image_html,
+        "{{REASON}}": html.escape(str(reason)),
+        "{{CONFIDENCE}}": html.escape(confidence_text),
+        "{{A_LAST_LINE}}": html.escape(str(a_line)),
+        "{{B_FIRST_LINE}}": html.escape(str(b_line)),
+        "{{PROMPT_HTML}}": prompt_html,
+    }
+    return _replace_template_tokens(_read_template(REPORT_CARD_TEMPLATE_PATH), replacements)
 
 
 def _inline_image_src(report_dir, relative_path):
@@ -729,11 +851,22 @@ def _read_report_text(report_dir, relative_path):
     return path.read_text(encoding="utf-8")
 
 
+def _read_template(path):
+    return path.read_text(encoding="utf-8")
+
+
+def _replace_template_tokens(template, replacements):
+    rendered = template
+    for token, value in replacements.items():
+        rendered = rendered.replace(token, value)
+    return rendered
+
+
 def _status_label(merge_status):
     return {
-        "merge_true": "合并",
-        "merge_false": "未合并",
-        "merge_unknown": "未知",
+        "merge_true": "Merge",
+        "merge_false": "No merge",
+        "merge_unknown": "Unknown",
     }.get(merge_status, merge_status)
 
 
@@ -741,23 +874,150 @@ def _judge_with_lmstudio(candidate, prompt=None):
     image = candidate.get("image")
     if image is None:
         raise RuntimeError("page_images is required when no judge is injected")
-    prompt = prompt or _prompt_for_candidate(candidate)
     pair = candidate.get("pair")
-    return _call_model(prompt, image, pair=pair)
+    layout_prompt = _layout_filter_prompt_for_candidate(candidate)
+    layout_decision = _call_model(
+        layout_prompt,
+        image,
+        pair=pair,
+        response_schema=LAYOUT_FILTER_SCHEMA,
+        stage="layout_filter",
+    )
+    text_prompt = _text_continuity_prompt_for_candidate(candidate)
+    text_decision = _call_model(
+        text_prompt,
+        image,
+        pair=pair,
+        response_schema=TEXT_CONTINUITY_SCHEMA,
+        stage="text_continuity",
+    )
+    adjudication_prompt = _adjudication_prompt_for_candidate(
+        candidate,
+        layout_decision,
+        text_decision,
+    )
+    decision = _call_model(
+        adjudication_prompt,
+        image,
+        pair=pair,
+        response_schema=SCHEMA,
+        stage="adjudication",
+    )
+    decision = _normalize_adjudication_from_stage_decisions(candidate, decision, layout_decision, text_decision)
+    decision["_stage_decisions"] = {
+        "layout_filter": layout_decision,
+        "text_continuity": text_decision,
+    }
+    return decision
 
 
-def _call_model(prompt, image, pair=None):
+def _normalize_adjudication_from_stage_decisions(candidate, decision, layout_decision, text_decision):
+    marker_type = layout_decision.get("new_marker_type")
+    has_marker = layout_decision.get("b_has_new_list_or_clause_marker") is True
+    continuation_type = text_decision.get("continuation_type")
+    text_positive = (
+        text_decision.get("a_is_textually_unclosed") is True
+        or text_decision.get("same_body_flow") is True
+        or continuation_type in {
+            "same_identifier_body",
+            "unfinished_phrase",
+            "inline_enumeration",
+            "same_item_body",
+        }
+    )
+    text_negative = (
+        text_decision.get("a_is_textually_unclosed") is False
+        and text_decision.get("same_body_flow") is False
+    )
+    layout_negative = layout_decision.get("b_starts_new_block_by_layout") is True
+
+    if marker_type in {"sibling", "child", "parent", "heading", "label"} or (has_marker and marker_type != "none"):
+        return _with_forced_decision(
+            candidate,
+            decision,
+            is_continuation=False,
+            confidence=max(float(decision.get("confidence") or 0), 0.95),
+            basis=f"Stage filter found an explicit new-block marker: {layout_decision.get('evidence', '')}"[:120],
+        )
+
+    if marker_type == "none" and text_positive:
+        if text_decision.get("same_body_flow") is True:
+            basis_prefix = "No explicit new marker; text stage found same-block continuation"
+        elif text_decision.get("a_is_textually_unclosed") is True:
+            basis_prefix = "No explicit new marker; A is unclosed, so progressive filtering merges"
+        else:
+            basis_prefix = f"No explicit new marker; text continuation type is {continuation_type}"
+        return _with_forced_decision(
+            candidate,
+            decision,
+            is_continuation=True,
+            confidence=max(float(decision.get("confidence") or 0), 0.9),
+            basis=f"{basis_prefix}: {text_decision.get('evidence', '')}"[:120],
+        )
+
+    if layout_negative and text_negative:
+        return _with_forced_decision(
+            candidate,
+            decision,
+            is_continuation=False,
+            confidence=max(float(decision.get("confidence") or 0), 0.9),
+            basis=f"Layout and text stages both indicate a new block: {layout_decision.get('evidence', '')}"[:120],
+        )
+
+    return decision
+
+
+def _with_forced_decision(candidate, decision, is_continuation, confidence, basis):
+    metadata = candidate.get("metadata") or {}
+    a_last_line = (
+        decision.get("a_last_line")
+        or metadata.get("region_A_previous_leaf", {}).get("a_last_line")
+        or ""
+    )
+    b_first_line = (
+        decision.get("b_first_line")
+        or metadata.get("region_B_current_leaf", {}).get("b_first_line")
+        or ""
+    )
+    joined_preview = decision.get("joined_preview") or f"{a_last_line} {b_first_line}".strip()
+    return {
+        **decision,
+        "is_continuation": is_continuation,
+        "confidence": min(max(confidence, 0), 1),
+        "target": "previous_leaf" if is_continuation else "none",
+        "a_last_line": a_last_line,
+        "b_first_line": b_first_line,
+        "joined_preview": joined_preview[:240],
+        "b_starts_new_unit": not is_continuation,
+        "same_list_item_body": bool(decision.get("same_list_item_body")) if is_continuation else False,
+        "decision_basis": basis,
+    }
+
+
+def _call_model(prompt, image, pair=None, response_schema=SCHEMA, stage=None):
     model = _model_name()
     api_url = _api_url()
     api_key = _api_key()
     image_url = "data:image/png;base64," + _encode_image(image)
-    payload = _make_chat_payload(model, prompt, image_url)
+    payload = _make_chat_payload(model, prompt, image_url, response_schema=response_schema)
     errors = []
     request_start = time.time()
-    logger.info("VLM model request begin: pair={}, model={}, api_url={}", pair, model, api_url)
+    logger.info(
+        "VLM model request begin: pair={}, stage={}, model={}, api_url={}",
+        pair,
+        stage,
+        model,
+        api_url,
+    )
     for string_image_url in (False, True):
         if string_image_url:
-            payload = _make_chat_payload(model, prompt, image_url, string_image_url=True)
+            payload = _make_chat_payload(
+                model,
+                prompt,
+                image_url,
+                string_image_url=True,
+                response_schema=response_schema,
+            )
         for with_schema in (True, False):
             trial_payload = dict(payload)
             if not with_schema:
@@ -766,8 +1026,9 @@ def _call_model(prompt, image, pair=None):
                 try:
                     trial_start = time.time()
                     logger.debug(
-                        "VLM model request attempt: pair={}, attempt={}, schema={}, string_image_url={}",
+                        "VLM model request attempt: pair={}, stage={}, attempt={}, schema={}, string_image_url={}",
                         pair,
+                        stage,
                         attempt_index + 1,
                         with_schema,
                         string_image_url,
@@ -779,9 +1040,11 @@ def _call_model(prompt, image, pair=None):
                         logger.info("VLM model request empty content, trying stream: pair={}", pair)
                         raw = _request_stream_text(api_url, trial_payload, api_key=api_key)
                     decision = _parse_model_json(raw)
+                    _validate_model_json(decision, response_schema)
                     logger.info(
-                        "VLM model request success: pair={}, elapsed={}s, attempt_elapsed={}s, schema={}, string_image_url={}",
+                        "VLM model request success: pair={}, stage={}, elapsed={}s, attempt_elapsed={}s, schema={}, string_image_url={}",
                         pair,
+                        stage,
                         round(time.time() - request_start, 2),
                         round(time.time() - trial_start, 2),
                         with_schema,
@@ -795,8 +1058,9 @@ def _call_model(prompt, image, pair=None):
                         or not _should_retry_request_error(exc)
                     ):
                         logger.warning(
-                            "VLM model request attempt failed without retry: pair={}, attempt={}, schema={}, string_image_url={}, error={}: {}",
+                            "VLM model request attempt failed without retry: pair={}, stage={}, attempt={}, schema={}, string_image_url={}, error={}: {}",
                             pair,
+                            stage,
                             attempt_index + 1,
                             with_schema,
                             string_image_url,
@@ -806,8 +1070,9 @@ def _call_model(prompt, image, pair=None):
                         break
                     delay = REQUEST_RETRY_DELAYS_SECONDS[attempt_index]
                     logger.warning(
-                        "VLM model request retry: pair={}, attempt={}, sleep={}s, schema={}, string_image_url={}, error={}: {}",
+                        "VLM model request retry: pair={}, stage={}, attempt={}, sleep={}s, schema={}, string_image_url={}, error={}: {}",
                         pair,
+                        stage,
                         attempt_index + 1,
                         delay,
                         with_schema,
@@ -817,6 +1082,34 @@ def _call_model(prompt, image, pair=None):
                     )
                     time.sleep(delay)
     raise RuntimeError(" ; ".join(errors))
+
+
+def _validate_model_json(decision, response_schema):
+    schema = (response_schema or {}).get("json_schema", {}).get("schema", {})
+    if not schema:
+        return
+    if not isinstance(decision, dict):
+        raise ValueError("model response is not a JSON object")
+    properties = schema.get("properties", {})
+    for field in schema.get("required", []):
+        if field not in decision:
+            raise ValueError(f"model response missing required field: {field}")
+    for field, value in decision.items():
+        field_schema = properties.get(field)
+        if field_schema is None:
+            if schema.get("additionalProperties") is False:
+                raise ValueError(f"model response has unexpected field: {field}")
+            continue
+        expected_type = field_schema.get("type")
+        if expected_type == "boolean" and not isinstance(value, bool):
+            raise ValueError(f"model response field {field} must be boolean")
+        if expected_type == "number" and not isinstance(value, (int, float)):
+            raise ValueError(f"model response field {field} must be number")
+        if expected_type == "string" and not isinstance(value, str):
+            raise ValueError(f"model response field {field} must be string")
+        enum = field_schema.get("enum")
+        if enum is not None and value not in enum:
+            raise ValueError(f"model response field {field} has invalid enum value: {value}")
 
 
 def _should_retry_request_error(exc):
@@ -835,7 +1128,7 @@ def _http_status_code(exc):
     return None
 
 
-def _make_chat_payload(model, prompt, image_url, string_image_url=False):
+def _make_chat_payload(model, prompt, image_url, string_image_url=False, response_schema=SCHEMA):
     image_url_value = image_url if string_image_url else {"url": image_url}
     return {
         "model": model,
@@ -850,7 +1143,7 @@ def _make_chat_payload(model, prompt, image_url, string_image_url=False):
         ],
         "temperature": 0,
         "max_tokens": 520,
-        "response_format": SCHEMA,
+        "response_format": response_schema,
     }
 
 

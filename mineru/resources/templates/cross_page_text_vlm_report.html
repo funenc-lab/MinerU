@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cross Page Text VLM Report</title>
+<style>
+body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #1f2933; background: #f6f7f9; }
+header { padding: 20px 24px 12px; background: #fff; border-bottom: 1px solid #d9dee7; position: sticky; top: 0; z-index: 2; }
+h1 { margin: 0 0 10px; font-size: 22px; }
+.summary { display: flex; flex-wrap: wrap; gap: 10px; font-size: 13px; }
+.summary span { background: #eef2f7; border: 1px solid #d9dee7; border-radius: 6px; padding: 6px 9px; }
+.tabs { margin-top: 12px; display: flex; gap: 8px; flex-wrap: wrap; }
+.tabs button { border: 1px solid #b8c0cc; background: #fff; border-radius: 6px; padding: 7px 11px; cursor: pointer; }
+.tabs button.active { background: #263445; color: #fff; border-color: #263445; }
+main { padding: 18px 24px 28px; }
+.grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.card { background: #fff; border: 1px solid #d9dee7; border-radius: 8px; overflow: hidden; }
+.card.merge_true { border-left: 6px solid #168a4a; }
+.card.merge_false { border-left: 6px solid #b45309; }
+.card.merge_unknown { border-left: 6px solid #7b8794; }
+.card-header { padding: 12px 14px; border-bottom: 1px solid #e5e9f0; display: flex; justify-content: space-between; gap: 12px; }
+.pair { font-weight: 700; }
+.status { font-size: 12px; border-radius: 999px; padding: 3px 8px; background: #eef2f7; }
+.body { padding: 12px 14px; }
+img { width: 100%; height: auto; display: block; border: 1px solid #e5e9f0; border-radius: 6px; background: #fff; }
+.reason { margin: 10px 0 8px; line-height: 1.5; }
+.meta { font-size: 12px; color: #52606d; line-height: 1.45; }
+.prompt summary { margin-top: 8px; cursor: pointer; font-size: 12px; color: #1f5fbf; }
+pre { white-space: pre-wrap; word-break: break-word; background: #f3f5f8; border-radius: 6px; padding: 10px; font-size: 12px; }
+a { color: #1f5fbf; }
+@media (max-width: 980px) { .grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+<h1>Cross Page Text VLM Report</h1>
+<div class="summary">
+<span>Total {{TOTAL}}</span>
+<span>Merge {{MERGE_TRUE}}</span>
+<span>No merge {{MERGE_FALSE}}</span>
+<span>Unknown {{MERGE_UNKNOWN}}</span>
+<span>Model {{MODEL}}</span>
+<span>Prompt {{PROMPT_TEMPLATE}}</span>
+</div>
+<div class="tabs">
+<button class="active" data-filter="all">All</button>
+<button data-filter="merge_true">Merge</button>
+<button data-filter="merge_false">No merge</button>
+<button data-filter="merge_unknown">Unknown</button>
+</div>
+</header>
+<main>
+<div class="grid">
+{{CARDS}}
+</div>
+<h2>summary.json</h2>
+<pre>{{SUMMARY_JSON}}</pre>
+</main>
+<script>
+const buttons = document.querySelectorAll(".tabs button");
+const cards = document.querySelectorAll(".card");
+buttons.forEach((button) => button.addEventListener("click", () => {
+  const filter = button.dataset.filter;
+  buttons.forEach((item) => item.classList.remove("active"));
+  button.classList.add("active");
+  cards.forEach((card) => {
+    card.style.display = filter === "all" || card.dataset.status === filter ? "" : "none";
+  });
+}));
+</script>
+</body>
+</html>
