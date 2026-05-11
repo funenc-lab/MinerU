@@ -20,6 +20,9 @@ mineru -p demo/pdfs/demo1.pdf -o output/
 ## Coding Style & Naming Conventions
 Follow existing Python style: 4-space indentation, `snake_case` for functions and modules, `PascalCase` for classes, and explicit imports grouped by standard library, third-party, then local modules. Keep new CLI commands under `mineru/cli/` and mirror backend-specific behavior in the matching backend package. Favor small helpers over large mixed-responsibility functions.
 
+## VLM Cross-Page Repair Guidelines
+For cross-page VLM break repair, avoid detailed pattern matching tied to specific phrases, labels, document layouts, or isolated examples. Prefer generalizable, structure-driven heuristics based on page/block continuity, semantic completeness, and backend-agnostic signals. Add narrow special cases only when they are clearly justified by regression tests and cannot be represented by a more general rule.
+
 ## Testing Guidelines
 Add or update `pytest` coverage for behavior changes, especially parsing regressions. Extend `tests/unittest/test_e2e.py` when output contracts change, and keep fixture files small and deterministic. Name new tests `test_<feature>.py` or `test_<behavior>()`. Run the target test locally before opening a PR.
 
