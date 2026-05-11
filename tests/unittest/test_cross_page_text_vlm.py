@@ -3,13 +3,13 @@ from PIL import Image
 from mineru.backend.utils import cross_page_text_vlm as vlm
 
 
-def test_vlm_judge_runs_layout_text_and_adjudication_stages(monkeypatch):
+def test_vlm_judge_runs_feature_and_scoring_stages(monkeypatch):
     candidate = {
         "pair": "000-001",
         "metadata": {
             "prev_page_idx": 0,
             "current_page_idx": 1,
-            "region_A_previous_leaf": {"a_last_line": "A tail,"},
+            "region_A_previous_leaf": {"a_last_line": "A tail."},
             "region_B_current_leaf": {"b_first_line": "B head"},
         },
         "image": Image.new("RGB", (12, 12), "white"),
@@ -26,36 +26,20 @@ def test_vlm_judge_runs_layout_text_and_adjudication_stages(monkeypatch):
                 "image": image,
             }
         )
-        if stage == "layout_filter":
+        if stage == "feature_extract":
             return {
-                "body_x_alignment": "aligned",
-                "b_has_new_paragraph_start": False,
-                "b_has_new_list_or_clause_marker": False,
-                "new_marker_type": "none",
-                "b_starts_new_block_by_layout": False,
-                "evidence": "Body X is approximately aligned and B has no new marker",
+                "marker_role": "none",
+                "body_x": "aligned",
+                "body_flow": "same",
             }
-        if stage == "text_continuity":
+        if stage == "scoring":
+            assert '"marker_role": "none"' in prompt
+            assert '"body_x": "aligned"' in prompt
             return {
-                "a_is_textually_unclosed": True,
-                "b_completes_a": True,
-                "same_body_flow": True,
-                "continuation_type": "unfinished_phrase",
-                "evidence": "A ends with a comma and B completes the same body",
-            }
-        if stage == "adjudication":
-            assert '"body_x_alignment": "aligned"' in prompt
-            assert '"same_body_flow": true' in prompt
-            return {
-                "is_continuation": True,
-                "confidence": 0.95,
-                "target": "previous_leaf",
-                "a_last_line": "A tail,",
-                "b_first_line": "B head",
-                "joined_preview": "A tail, B head",
-                "b_starts_new_unit": False,
-                "same_list_item_body": True,
-                "decision_basis": "Layout is aligned and text is continuous",
+                "merge_score": 35,
+                "new_unit_score": 65,
+                "decision": "no_merge",
+                "reason": "Scoring model was conservative, but hard rule should merge.",
             }
         raise AssertionError(f"unexpected stage: {stage}")
 
@@ -63,57 +47,115 @@ def test_vlm_judge_runs_layout_text_and_adjudication_stages(monkeypatch):
 
     decision = vlm._judge_with_lmstudio(candidate)
 
-    assert [call["stage"] for call in calls] == [
-        "layout_filter",
-        "text_continuity",
-        "adjudication",
-    ]
+    assert [call["stage"] for call in calls] == ["feature_extract", "scoring"]
     assert decision["is_continuation"] is True
-    assert decision["_stage_decisions"]["layout_filter"]["body_x_alignment"] == "aligned"
-    assert decision["_stage_decisions"]["text_continuity"]["same_body_flow"] is True
+    assert decision["target"] == "previous_leaf"
+    assert decision["b_starts_new_unit"] is False
+    assert decision["_stage_decisions"]["feature_extract"]["body_x"] == "aligned"
+    assert decision["_stage_decisions"]["scoring"]["decision"] == "no_merge"
 
 
-def test_vlm_judge_normalizes_adjudication_from_stage_outputs(monkeypatch):
+def test_vlm_judge_explicit_marker_role_forces_no_merge(monkeypatch):
     candidate = {
         "pair": "000-001",
         "metadata": {
             "prev_page_idx": 0,
             "current_page_idx": 1,
-            "region_A_previous_leaf": {"a_last_line": "A tail involve"},
+            "region_A_previous_leaf": {"a_last_line": "A closed sentence."},
+            "region_B_current_leaf": {"b_first_line": "B new item"},
+        },
+        "image": Image.new("RGB", (12, 12), "white"),
+    }
+
+    def fake_call_model(prompt, image, pair=None, response_schema=None, stage=None):
+        if stage == "feature_extract":
+            return {
+                "marker_role": "heading",
+                "body_x": "aligned",
+                "body_flow": "same",
+            }
+        if stage == "scoring":
+            return {
+                "merge_score": 95,
+                "new_unit_score": 10,
+                "decision": "merge",
+                "reason": "Scoring model overrode marker evidence.",
+            }
+        raise AssertionError(f"unexpected stage: {stage}")
+
+    monkeypatch.setattr(vlm, "_call_model", fake_call_model)
+
+    decision = vlm._judge_with_lmstudio(candidate)
+
+    assert decision["is_continuation"] is False
+    assert decision["target"] == "none"
+    assert decision["b_starts_new_unit"] is True
+    assert "explicit new structural marker" in decision["decision_basis"]
+
+
+def test_vlm_judge_unclear_body_x_does_not_merge(monkeypatch):
+    candidate = {
+        "pair": "000-001",
+        "metadata": {
+            "prev_page_idx": 0,
+            "current_page_idx": 1,
+            "region_A_previous_leaf": {"a_last_line": "A tail"},
             "region_B_current_leaf": {"b_first_line": "B head"},
         },
         "image": Image.new("RGB", (12, 12), "white"),
     }
 
     def fake_call_model(prompt, image, pair=None, response_schema=None, stage=None):
-        if stage == "layout_filter":
+        if stage == "feature_extract":
             return {
-                "body_x_alignment": "shifted",
-                "b_has_new_paragraph_start": True,
-                "b_has_new_list_or_clause_marker": False,
-                "new_marker_type": "none",
-                "b_starts_new_block_by_layout": True,
-                "evidence": "B looks like a new paragraph but has no new marker",
+                "marker_role": "none",
+                "body_x": "unclear",
+                "body_flow": "same",
             }
-        if stage == "text_continuity":
+        if stage == "scoring":
             return {
-                "a_is_textually_unclosed": True,
-                "b_completes_a": False,
-                "same_body_flow": False,
-                "continuation_type": "none",
-                "evidence": "A is unclosed",
+                "merge_score": 92,
+                "new_unit_score": 8,
+                "decision": "merge",
+                "reason": "Body flow looks continuous, but body-X is unclear.",
             }
-        if stage == "adjudication":
+        raise AssertionError(f"unexpected stage: {stage}")
+
+    monkeypatch.setattr(vlm, "_call_model", fake_call_model)
+
+    decision = vlm._judge_with_lmstudio(candidate)
+
+    assert decision["is_continuation"] is False
+    assert decision["target"] == "none"
+    assert decision["b_starts_new_unit"] is True
+    assert "body-X is unclear" in decision["decision_basis"]
+
+
+def test_vlm_judge_closed_a_still_merges_when_marker_absent_and_body_x_aligned(monkeypatch):
+    candidate = {
+        "pair": "000-001",
+        "metadata": {
+            "prev_page_idx": 0,
+            "current_page_idx": 1,
+            "region_A_previous_leaf": {"a_last_line": "A complete sentence."},
+            "region_B_current_leaf": {"b_first_line": "B continues the same body."},
+        },
+        "image": Image.new("RGB", (12, 12), "white"),
+    }
+
+    def fake_call_model(prompt, image, pair=None, response_schema=None, stage=None):
+        if stage == "feature_extract":
             return {
-                "is_continuation": False,
-                "confidence": 0.9,
-                "target": "none",
-                "a_last_line": "A tail involve",
-                "b_first_line": "B head",
-                "joined_preview": "A tail involve B head",
-                "b_starts_new_unit": True,
-                "same_list_item_body": False,
-                "decision_basis": "Final model incorrectly chose a new block",
+                "marker_role": "none",
+                "body_x": "aligned",
+                "body_flow": "same",
+            }
+        if stage == "scoring":
+            return {
+                "merge_score": 40,
+                "new_unit_score": 60,
+                "decision": "unknown",
+                "reason": "A is closed, but features support merge.",
             }
         raise AssertionError(f"unexpected stage: {stage}")
 
@@ -123,7 +165,8 @@ def test_vlm_judge_normalizes_adjudication_from_stage_outputs(monkeypatch):
 
     assert decision["is_continuation"] is True
     assert decision["target"] == "previous_leaf"
-    assert decision["b_starts_new_unit"] is False
+    assert decision["a_last_line"] == "A complete sentence."
+    assert decision["b_first_line"] == "B continues the same body."
 
 
 def test_report_html_uses_external_templates(tmp_path):
@@ -158,12 +201,9 @@ def test_report_html_uses_external_templates(tmp_path):
     assert "Total 1" in html
 
 
-def test_prompts_define_same_item_body_and_body_x_rules():
-    assert "A page break may split the body of one numbered/list item" in (
-        vlm.TEXT_CONTINUITY_PROMPT_TEMPLATE
-    )
-    assert "A clause/list number at the beginning of A does not by itself make A a heading" in (
-        vlm.TEXT_CONTINUITY_PROMPT_TEMPLATE
-    )
-    assert "compare the prose body-text start x" in vlm.LAYOUT_FILTER_PROMPT_TEMPLATE.lower()
-    assert "same numbered/list item" in vlm.ADJUDICATION_PROMPT_TEMPLATE
+def test_prompts_define_general_marker_and_body_x_rules():
+    assert "function, not concrete syntax" in vlm.FEATURE_PROMPT_TEMPLATE
+    assert "structural anchor" in vlm.FEATURE_PROMPT_TEMPLATE
+    assert "ignore that marker column" in vlm.FEATURE_PROMPT_TEMPLATE
+    assert "A's closed punctuation or complete sentence ending" in vlm.SCORING_PROMPT_TEMPLATE
+    assert "0-100" in vlm.SCORING_PROMPT_TEMPLATE
