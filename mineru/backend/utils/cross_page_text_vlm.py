@@ -592,22 +592,15 @@ def _prompt_for_candidate(candidate):
     return PROMPT_TEMPLATE.format(metadata=json.dumps(candidate["metadata"], ensure_ascii=False, indent=2))
 
 
-def _layout_filter_prompt_for_candidate(candidate):
-    return LAYOUT_FILTER_PROMPT_TEMPLATE.format(
+def _feature_prompt_for_candidate(candidate):
+    return FEATURE_PROMPT_TEMPLATE.format(
         metadata=json.dumps(candidate["metadata"], ensure_ascii=False, indent=2)
     )
 
 
-def _text_continuity_prompt_for_candidate(candidate):
-    return TEXT_CONTINUITY_PROMPT_TEMPLATE.format(
-        metadata=json.dumps(candidate["metadata"], ensure_ascii=False, indent=2)
-    )
-
-
-def _adjudication_prompt_for_candidate(candidate, layout_decision, text_decision):
-    return ADJUDICATION_PROMPT_TEMPLATE.format(
-        layout_decision=json.dumps(layout_decision, ensure_ascii=False, indent=2),
-        text_decision=json.dumps(text_decision, ensure_ascii=False, indent=2),
+def _scoring_prompt_for_candidate(candidate, features):
+    return SCORING_PROMPT_TEMPLATE.format(
+        features=json.dumps(features, ensure_ascii=False, indent=2),
         metadata=json.dumps(candidate["metadata"], ensure_ascii=False, indent=2),
     )
 
@@ -787,123 +780,143 @@ def _judge_with_lmstudio(candidate, prompt=None):
     if image is None:
         raise RuntimeError("page_images is required when no judge is injected")
     pair = candidate.get("pair")
-    layout_prompt = _layout_filter_prompt_for_candidate(candidate)
-    layout_decision = _call_model(
-        layout_prompt,
+    feature_prompt = _feature_prompt_for_candidate(candidate)
+    features = _call_model(
+        feature_prompt,
         image,
         pair=pair,
-        response_schema=LAYOUT_FILTER_SCHEMA,
-        stage="layout_filter",
+        response_schema=FEATURE_SCHEMA,
+        stage="feature_extract",
     )
-    text_prompt = _text_continuity_prompt_for_candidate(candidate)
-    text_decision = _call_model(
-        text_prompt,
+    scoring_prompt = _scoring_prompt_for_candidate(candidate, features)
+    scoring = _call_model(
+        scoring_prompt,
         image,
         pair=pair,
-        response_schema=TEXT_CONTINUITY_SCHEMA,
-        stage="text_continuity",
+        response_schema=SCORING_SCHEMA,
+        stage="scoring",
     )
-    adjudication_prompt = _adjudication_prompt_for_candidate(
-        candidate,
-        layout_decision,
-        text_decision,
-    )
-    decision = _call_model(
-        adjudication_prompt,
-        image,
-        pair=pair,
-        response_schema=SCHEMA,
-        stage="adjudication",
-    )
-    decision = _normalize_adjudication_from_stage_decisions(candidate, decision, layout_decision, text_decision)
+    decision = _normalize_scoring_from_features(candidate, features, scoring)
     decision["_stage_decisions"] = {
-        "layout_filter": layout_decision,
-        "text_continuity": text_decision,
+        "feature_extract": features,
+        "scoring": scoring,
     }
     return decision
 
 
-def _normalize_adjudication_from_stage_decisions(candidate, decision, layout_decision, text_decision):
-    marker_type = layout_decision.get("new_marker_type")
-    has_marker = layout_decision.get("b_has_new_list_or_clause_marker") is True
-    continuation_type = text_decision.get("continuation_type")
-    text_positive = (
-        text_decision.get("a_is_textually_unclosed") is True
-        or text_decision.get("same_body_flow") is True
-        or continuation_type in {
-            "same_identifier_body",
-            "unfinished_phrase",
-            "inline_enumeration",
-            "same_item_body",
-        }
-    )
-    text_negative = (
-        text_decision.get("a_is_textually_unclosed") is False
-        and text_decision.get("same_body_flow") is False
-    )
-    layout_negative = layout_decision.get("b_starts_new_block_by_layout") is True
+NEW_UNIT_MARKER_ROLES = {
+    "sibling",
+    "child",
+    "parent",
+    "heading",
+    "label",
+    "independent_item",
+}
 
-    if marker_type in {"sibling", "child", "parent", "heading", "label"} or (has_marker and marker_type != "none"):
-        return _with_forced_decision(
+
+def _normalize_scoring_from_features(candidate, features, scoring):
+    marker_role = features.get("marker_role")
+    body_x = features.get("body_x")
+    scoring_decision = scoring.get("decision")
+    merge_score = int(scoring.get("merge_score") or 0)
+    new_unit_score = int(scoring.get("new_unit_score") or 0)
+
+    if marker_role in NEW_UNIT_MARKER_ROLES:
+        return _decision_from_scoring(
             candidate,
-            decision,
+            scoring,
             is_continuation=False,
-            confidence=max(float(decision.get("confidence") or 0), 0.95),
-            basis=f"Stage filter found an explicit new-block marker: {layout_decision.get('evidence', '')}"[:120],
+            confidence=max(_score_to_confidence(new_unit_score), 0.95),
+            basis=f"Feature extraction found an explicit new structural marker: {marker_role}",
         )
 
-    if marker_type == "none" and text_positive:
-        if text_decision.get("same_body_flow") is True:
-            basis_prefix = "No explicit new marker; text stage found same-block continuation"
-        elif text_decision.get("a_is_textually_unclosed") is True:
-            basis_prefix = "No explicit new marker; A is unclosed, so progressive filtering merges"
-        else:
-            basis_prefix = f"No explicit new marker; text continuation type is {continuation_type}"
-        return _with_forced_decision(
+    if marker_role == "none" and body_x == "aligned":
+        return _decision_from_scoring(
             candidate,
-            decision,
+            scoring,
             is_continuation=True,
-            confidence=max(float(decision.get("confidence") or 0), 0.9),
-            basis=f"{basis_prefix}: {text_decision.get('evidence', '')}"[:120],
+            confidence=max(_score_to_confidence(merge_score), 0.9),
+            basis="No structural marker and body-X is aligned",
         )
 
-    if layout_negative and text_negative:
-        return _with_forced_decision(
+    if marker_role == "none" and body_x == "unclear":
+        return _decision_from_scoring(
             candidate,
-            decision,
+            scoring,
             is_continuation=False,
-            confidence=max(float(decision.get("confidence") or 0), 0.9),
-            basis=f"Layout and text stages both indicate a new block: {layout_decision.get('evidence', '')}"[:120],
+            confidence=max(_score_to_confidence(new_unit_score), 0.5),
+            basis="No structural marker, but body-X is unclear; conservative no-merge",
         )
 
-    return decision
+    if marker_role == "unclear":
+        return _decision_from_scoring(
+            candidate,
+            scoring,
+            is_continuation=False,
+            confidence=max(_score_to_confidence(new_unit_score), 0.5),
+            basis="Structural marker role is unclear; conservative no-merge",
+        )
+
+    if scoring_decision == "merge" and merge_score >= 70 and new_unit_score < 70:
+        return _decision_from_scoring(
+            candidate,
+            scoring,
+            is_continuation=True,
+            confidence=_score_to_confidence(merge_score),
+            basis=scoring.get("reason") or "Scoring stage selected merge",
+        )
+
+    if scoring_decision == "no_merge" or new_unit_score >= 70:
+        return _decision_from_scoring(
+            candidate,
+            scoring,
+            is_continuation=False,
+            confidence=_score_to_confidence(max(new_unit_score, 70)),
+            basis=scoring.get("reason") or "Scoring stage selected no_merge",
+        )
+
+    return _decision_from_scoring(
+        candidate,
+        scoring,
+        is_continuation=False,
+        confidence=max(_score_to_confidence(max(merge_score, new_unit_score)), 0.5),
+        basis=scoring.get("reason") or "Scoring stage was uncertain; conservative no-merge",
+    )
 
 
-def _with_forced_decision(candidate, decision, is_continuation, confidence, basis):
+def _decision_from_scoring(candidate, scoring, is_continuation, confidence, basis):
     metadata = candidate.get("metadata") or {}
     a_last_line = (
-        decision.get("a_last_line")
-        or metadata.get("region_A_previous_leaf", {}).get("a_last_line")
+        metadata.get("region_A_previous_leaf", {}).get("a_last_line")
         or ""
     )
     b_first_line = (
-        decision.get("b_first_line")
-        or metadata.get("region_B_current_leaf", {}).get("b_first_line")
+        metadata.get("region_B_current_leaf", {}).get("b_first_line")
         or ""
     )
-    joined_preview = decision.get("joined_preview") or f"{a_last_line} {b_first_line}".strip()
+    joined_preview = f"{a_last_line} {b_first_line}".strip()
     return {
-        **decision,
         "is_continuation": is_continuation,
-        "confidence": min(max(confidence, 0), 1),
+        "confidence": min(max(float(confidence), 0), 1),
         "target": "previous_leaf" if is_continuation else "none",
         "a_last_line": a_last_line,
         "b_first_line": b_first_line,
         "joined_preview": joined_preview[:240],
         "b_starts_new_unit": not is_continuation,
-        "same_list_item_body": bool(decision.get("same_list_item_body")) if is_continuation else False,
-        "decision_basis": basis,
+        "same_list_item_body": False,
+        "decision_basis": str(basis or scoring.get("reason") or "")[:240],
+        "merge_score": scoring.get("merge_score"),
+        "new_unit_score": scoring.get("new_unit_score"),
+        "scoring_decision": scoring.get("decision"),
     }
+
+
+def _score_to_confidence(score):
+    try:
+        value = int(score)
+    except (TypeError, ValueError):
+        return 0
+    return min(max(value, 0), 100) / 100
 
 
 def _call_model(prompt, image, pair=None, response_schema=SCHEMA, stage=None):
